@@ -1,7 +1,7 @@
 package archiver
 
 import (
-	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -29,6 +29,14 @@ const (
 	StatusCompleted  TaskStatus = "completed"
 	StatusFailed     TaskStatus = "failed"
 )
+
+// maxActiveTasksPerServer is the number of archive tasks a single server may
+// have pending or processing at the same time.
+const maxActiveTasksPerServer = 2
+
+// ErrTooManyTasks is returned when a server already has the maximum number of
+// archive tasks running.
+var ErrTooManyTasks = errors.New("archiver: too many archive tasks are already running for this server")
 
 // Task represents an archive operation (compress or decompress)
 type Task struct {
@@ -62,7 +70,7 @@ var instance = &Manager{
 }
 
 // NewCompressTask creates a new compression task
-func NewCompressTask(s *server.Server, rootPath string, files []string) *Task {
+func NewCompressTask(s *server.Server, rootPath string, files []string) (*Task, error) {
 	task := &Task{
 		Identifier: uuid.New().String(),
 		ServerID:   s.ID(),
@@ -74,16 +82,14 @@ func NewCompressTask(s *server.Server, rootPath string, files []string) *Task {
 		server:     s,
 	}
 
-	instance.mu.Lock()
-	instance.tasks[task.Identifier] = task
-	instance.serverTasks[s.ID()] = append(instance.serverTasks[s.ID()], task.Identifier)
-	instance.mu.Unlock()
-
-	return task
+	if err := instance.add(task); err != nil {
+		return nil, err
+	}
+	return task, nil
 }
 
 // NewDecompressTask creates a new decompression task
-func NewDecompressTask(s *server.Server, rootPath, file string) *Task {
+func NewDecompressTask(s *server.Server, rootPath, file string) (*Task, error) {
 	task := &Task{
 		Identifier: uuid.New().String(),
 		ServerID:   s.ID(),
@@ -95,12 +101,33 @@ func NewDecompressTask(s *server.Server, rootPath, file string) *Task {
 		server:     s,
 	}
 
-	instance.mu.Lock()
-	instance.tasks[task.Identifier] = task
-	instance.serverTasks[s.ID()] = append(instance.serverTasks[s.ID()], task.Identifier)
-	instance.mu.Unlock()
+	if err := instance.add(task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
 
-	return task
+// add registers a task, unless its server already has the maximum number of
+// tasks pending or processing.
+func (m *Manager) add(task *Task) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var active int
+	for _, id := range m.serverTasks[task.ServerID] {
+		if t, ok := m.tasks[id]; ok {
+			if st := t.GetStatus(); st == StatusPending || st == StatusProcessing {
+				active++
+			}
+		}
+	}
+	if active >= maxActiveTasksPerServer {
+		return ErrTooManyTasks
+	}
+
+	m.tasks[task.Identifier] = task
+	m.serverTasks[task.ServerID] = append(m.serverTasks[task.ServerID], task.Identifier)
+	return nil
 }
 
 // Execute runs the archive task
@@ -132,7 +159,8 @@ func (t *Task) Execute() {
 			}
 		}
 	} else {
-		err = t.server.Filesystem().DecompressFile(context.Background(), t.RootPath, t.File)
+		// Use the server context so that decompression stops if the server is deleted.
+		err = t.server.Filesystem().DecompressFile(t.server.Context(), t.RootPath, t.File)
 	}
 
 	t.mu.Lock()

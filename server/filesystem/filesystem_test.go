@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	. "github.com/franela/goblin"
+	ignore "github.com/sabhiram/go-gitignore"
 
 	"github.com/pterodactyl/wings/internal/ufs"
 
@@ -491,6 +492,58 @@ func TestFilesystem_Copy(t *testing.T) {
 
 			_, err = os.Stat(filepath.Join(rfs.root, "server/dir copy"))
 			g.Assert(err).IsNil()
+		})
+
+		g.It("should copy a nested directory next to the source with its contents", func() {
+			err := os.MkdirAll(filepath.Join(rfs.root, "server/parent/dir/sub"), 0o755)
+			g.Assert(err).IsNil()
+			err = rfs.CreateServerFileFromString("parent/dir/sub/file.txt", "nested content")
+			g.Assert(err).IsNil()
+
+			err = fs.Copy("parent/dir")
+			g.Assert(err).IsNil()
+
+			b, err := os.ReadFile(filepath.Join(rfs.root, "server/parent/dir copy/sub/file.txt"))
+			g.Assert(err).IsNil()
+			g.Assert(string(b)).Equal("nested content")
+
+			_, err = os.Stat(filepath.Join(rfs.root, "server/dir copy"))
+			g.Assert(errors.Is(err, os.ErrNotExist)).IsTrue("copy was created at the root")
+		})
+
+		g.It("should not copy files on the denylist when copying a directory", func() {
+			fs.denylist = ignore.CompileIgnoreLines("/dir/secret.yml")
+			defer func() { fs.denylist = ignore.CompileIgnoreLines() }()
+
+			err := os.Mkdir(filepath.Join(rfs.root, "server/dir"), 0o755)
+			g.Assert(err).IsNil()
+			err = rfs.CreateServerFileFromString("dir/secret.yml", "secret")
+			g.Assert(err).IsNil()
+			err = rfs.CreateServerFileFromString("dir/public.yml", "public")
+			g.Assert(err).IsNil()
+
+			err = fs.Copy("dir")
+			g.Assert(err).IsNil()
+
+			_, err = rfs.StatServerFile("dir copy/public.yml")
+			g.Assert(err).IsNil()
+			_, err = rfs.StatServerFile("dir copy/secret.yml")
+			g.Assert(errors.Is(err, os.ErrNotExist)).IsTrue("denylisted file was copied")
+		})
+
+		g.It("should count a directory copy against the disk limit", func() {
+			err := os.Mkdir(filepath.Join(rfs.root, "server/dir"), 0o755)
+			g.Assert(err).IsNil()
+			err = rfs.CreateServerFileFromString("dir/file.txt", "some file content")
+			g.Assert(err).IsNil()
+			fs.SetDiskLimit(fs.CachedUsage() + 2)
+
+			err = fs.Copy("dir")
+			g.Assert(IsErrorCode(err, ErrCodeDiskSpace)).IsTrue("err is not ErrCodeDiskSpace")
+
+			_, err = rfs.StatServerFile("dir copy")
+			g.Assert(errors.Is(err, os.ErrNotExist)).IsTrue("copy was created over the disk limit")
+			fs.SetDiskLimit(0)
 		})
 
 		g.It("should return an error if there is not space to copy the file", func() {

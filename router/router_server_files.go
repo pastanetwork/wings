@@ -464,7 +464,13 @@ func postServerCompressFiles(c *gin.Context) {
 
 	// Async mode: run in background and return immediately
 	if !data.Foreground {
-		task := archiver.NewCompressTask(s, data.RootPath, data.Files)
+		task, err := archiver.NewCompressTask(s, data.RootPath, data.Files)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "Too many archive tasks are already running for this server.",
+			})
+			return
+		}
 		go task.Execute()
 		c.JSON(http.StatusAccepted, gin.H{
 			"identifier": task.Identifier,
@@ -514,7 +520,13 @@ func postServerDecompressFiles(c *gin.Context) {
 
 	// Async mode: run in background and return immediately
 	if !data.Foreground {
-		task := archiver.NewDecompressTask(s, data.RootPath, data.File)
+		task, err := archiver.NewDecompressTask(s, data.RootPath, data.File)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "Too many archive tasks are already running for this server.",
+			})
+			return
+		}
 		go task.Execute()
 		c.JSON(http.StatusAccepted, gin.H{
 			"identifier": task.Identifier,
@@ -806,7 +818,14 @@ func postFilesTouch(c *gin.Context) {
 		return
 	}
 
-	if _, err := s.Filesystem().Touch(cleanPath, os.O_RDONLY|os.O_CREATE); err != nil {
+	f, err := s.Filesystem().Touch(cleanPath, os.O_RDONLY|os.O_CREATE)
+	if err == nil {
+		err = f.Close()
+	}
+	if err == nil {
+		err = s.Filesystem().Chown(cleanPath)
+	}
+	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}

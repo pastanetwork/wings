@@ -36,6 +36,7 @@ const (
 	PermissionReceiveInstall   = "admin.websocket.install"
 	PermissionReceiveTransfer  = "admin.websocket.transfer"
 	PermissionReceiveBackups   = "backup.read"
+	PermissionReceiveArchives  = "file.read"
 )
 
 // writeTimeout is how long a single write to a websocket may take before the
@@ -171,8 +172,19 @@ func (h *Handler) SendJson(v Message) error {
 
 	// If the user does not have permission to see backup events, do not emit
 	// them over the socket.
-	if strings.HasPrefix(string(v.Event), server.BackupCompletedEvent) {
+	if strings.HasPrefix(string(v.Event), server.BackupCompletedEvent) ||
+		strings.HasPrefix(string(v.Event), server.BackupStartedEvent) ||
+		strings.HasPrefix(string(v.Event), server.BackupDeletedEvent) {
 		if !j.HasPermission(PermissionReceiveBackups) {
+			return nil
+		}
+	}
+
+	// Archive task events include file paths and errors, so only send them to
+	// users that can read the server's files.
+	switch v.Event {
+	case server.ArchiveStartedEvent, server.ArchiveCompletedEvent, server.ArchiveFailedEvent, server.ArchiveProgressEvent:
+		if !j.HasPermission(PermissionReceiveArchives) {
 			return nil
 		}
 	}

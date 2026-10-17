@@ -273,7 +273,7 @@ func getDownloadFileHead(c *gin.Context) {
 	// Get server
 	// Note: HEAD endpoint is a probe, so we don't consume the one-time token here.
 	s, ok := manager.Get(token.ServerUuid)
-	if !ok || !token.HasScope(tokens.FileDownload) {
+	if !ok || token.Denylisted() || !token.HasScope(tokens.FileDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
