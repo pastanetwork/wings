@@ -122,9 +122,11 @@ func (l Limits) AsContainerResources() container.Resources {
 	//
 	// @see https://github.com/pterodactyl/panel/issues/3988
 	if l.CpuLimit > 0 {
-		resources.CPUQuota = l.CpuLimit * 1_000
-		resources.CPUPeriod = 100_000
-		resources.CPUShares = 1024
+		cfg := config.Get().Docker
+		period := cfg.CpuPeriodMicroseconds()
+		resources.CPUQuota = l.CpuLimit * period / 100
+		resources.CPUPeriod = period
+		resources.CPUShares = cfg.CpuShares
 	}
 
 	// Similar to above, don't set the specific assigned CPUs if we didn't actually limit
@@ -169,21 +171,21 @@ func (v Variables) Get(key string) string {
 		return ""
 	}
 
-	switch val.(type) {
+	switch val := val.(type) {
 	case int:
-		return strconv.Itoa(val.(int))
+		return strconv.Itoa(val)
 	case int32:
-		return strconv.FormatInt(val.(int64), 10)
+		return strconv.FormatInt(int64(val), 10)
 	case int64:
-		return strconv.FormatInt(val.(int64), 10)
+		return strconv.FormatInt(val, 10)
 	case float32:
-		return fmt.Sprintf("%f", val.(float32))
+		return fmt.Sprintf("%f", val)
 	case float64:
-		return fmt.Sprintf("%f", val.(float64))
+		return fmt.Sprintf("%f", val)
 	case bool:
-		return strconv.FormatBool(val.(bool))
+		return strconv.FormatBool(val)
 	case string:
-		return val.(string)
+		return val
 	}
 
 	// TODO: I think we can add a check for val == nil and return an empty string for those

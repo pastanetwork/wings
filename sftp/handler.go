@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -23,6 +24,9 @@ const (
 	PermissionFileCreate      = "file.create"
 	PermissionFileUpdate      = "file.update"
 	PermissionFileDelete      = "file.delete"
+	sftpAttributeExtended     = 1 << 31
+	// maxOpenFiles is the number of files a session may have open at once.
+	maxOpenFiles = 64
 )
 
 type Handler struct {
@@ -33,11 +37,49 @@ type Handler struct {
 	permissions []string
 	logger      *log.Entry
 	ro          bool
+	open        atomic.Int32
+}
+
+// openFile returns a slot for a file opened by the session, or nil if the
+// session already has the most files open that it may.
+func (h *Handler) openFile() *openFile {
+	if h.open.Add(1) > maxOpenFiles {
+		h.open.Add(-1)
+		return nil
+	}
+	return &openFile{release: func() { h.open.Add(-1) }}
+}
+
+// openFile is a session's slot for an open file, released when it is closed.
+type openFile struct {
+	once    sync.Once
+	release func()
+}
+
+func (f *openFile) close() {
+	if f != nil {
+		f.once.Do(f.release)
+	}
+}
+
+// readerAt is a file opened for reading by a session.
+type readerAt struct {
+	io.ReaderAt
+	slot *openFile
+}
+
+func (r readerAt) Close() error {
+	r.slot.close()
+	if c, ok := r.ReaderAt.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 type quotaWriterAt struct {
 	io.WriterAt
 	server *server.Server
+	slot   *openFile
 }
 
 func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
@@ -53,6 +95,7 @@ func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (w quotaWriterAt) Close() error {
+	w.slot.close()
 	if c, ok := w.WriterAt.(io.Closer); ok {
 		return c.Close()
 	}
@@ -101,17 +144,22 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	if !h.can(PermissionFileReadContent) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
+	slot := h.openFile()
+	if slot == nil {
+		return nil, sftp.ErrSSHFxFailure
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	f, _, err := h.fs.File(request.Filepath)
 	if err != nil {
+		slot.close()
 		if !errors.Is(err, os.ErrNotExist) {
 			h.logger.WithField("error", err).Error("error processing readfile request")
 			return nil, sftp.ErrSSHFxFailure
 		}
 		return nil, sftp.ErrSSHFxNoSuchFile
 	}
-	return f, nil
+	return readerAt{ReaderAt: f, slot: slot}, nil
 }
 
 // Filewrite handles the write actions for a file on the system.
@@ -145,8 +193,13 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
+	slot := h.openFile()
+	if slot == nil {
+		return nil, sftp.ErrSSHFxFailure
+	}
 	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
 	if err != nil {
+		slot.close()
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
 	}
@@ -158,7 +211,30 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		event = server.ActivitySftpCreate
 	}
 	h.events.MustLog(event, FileAction{Entity: request.Filepath})
-	return quotaWriterAt{WriterAt: f, server: h.server}, nil
+	return quotaWriterAt{WriterAt: f, server: h.server, slot: slot}, nil
+}
+
+func setstatMode(request *sftp.Request) (os.FileMode, error) {
+	// pkg/sftp allocates the client-provided extended attribute count before
+	// validating the remaining packet length. Reject it before parsing to avoid
+	// allowing a small packet to request an effectively unbounded allocation.
+	if request.Flags&sftpAttributeExtended != 0 {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	attrs := request.Attributes()
+	if attrs == nil {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	mode := attrs.FileMode().Perm()
+	// If the client passes an invalid FileMode just use the default 0644.
+	if mode == 0o000 {
+		mode = os.FileMode(0o644)
+	}
+	// Force directories to be 0755.
+	if attrs.FileMode().IsDir() {
+		mode = 0o755
+	}
+	return mode, nil
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -179,14 +255,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode := request.Attributes().FileMode().Perm()
-		// If the client passes an invalid FileMode just use the default 0644.
-		if mode == 0o000 {
-			mode = os.FileMode(0o644)
-		}
-		// Force directories to be 0755.
-		if request.Attributes().FileMode().IsDir() {
-			mode = 0o755
+		mode, err := setstatMode(request)
+		if err != nil {
+			return err
 		}
 		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -195,7 +266,6 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			l.WithField("error", err).Error("failed to perform setstat on item")
 			return sftp.ErrSSHFxFailure
 		}
-		break
 	// Support renaming a file (aka Move).
 	case "Rename":
 		if !h.can(PermissionFileUpdate) {
@@ -209,7 +279,6 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpRename, FileAction{Entity: request.Filepath, Target: request.Target})
-		break
 	// Handle deletion of a directory. This will properly delete all of the files and
 	// folders within that directory if it is not already empty (unlike a lot of SFTP
 	// clients that must delete each file individually).
@@ -236,7 +305,6 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpCreateDirectory, FileAction{Entity: request.Filepath})
-		break
 	// Support creating symlinks between files. The source and target must resolve within
 	// the server home directory.
 	case "Symlink":
@@ -247,7 +315,6 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			l.WithField("target", request.Target).WithField("error", err).Error("failed to create symlink")
 			return sftp.ErrSSHFxFailure
 		}
-		break
 	// Called when deleting a file.
 	case "Remove":
 		if !h.can(PermissionFileDelete) {

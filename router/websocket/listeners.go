@@ -66,23 +66,6 @@ func (h *Handler) listenForExpiration(ctx context.Context) {
 	}
 }
 
-var e = []string{
-	server.StatsEvent,
-	server.StatusEvent,
-	server.ConsoleOutputEvent,
-	server.InstallOutputEvent,
-	server.InstallStartedEvent,
-	server.InstallCompletedEvent,
-	server.DaemonMessageEvent,
-	server.BackupStartedEvent,
-	server.BackupDeletedEvent,
-	server.BackupCompletedEvent,
-	server.BackupRestoreStartedEvent,
-	server.BackupRestoreCompletedEvent,
-	server.TransferLogsEvent,
-	server.TransferStatusEvent,
-}
-
 // ListenForServerEvents will listen for different events happening on a server
 // and send them along to the connected websocket client. This function will
 // block until the context provided to it is canceled.
@@ -115,7 +98,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			break
+			// Exits through the break after the select.
 		case b := <-logOutput:
 			sendErr := h.SendJson(Message{Event: server.ConsoleOutputEvent, Args: []string{string(b)}})
 			if sendErr == nil {

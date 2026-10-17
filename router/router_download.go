@@ -110,12 +110,13 @@ func getDownloadBackupHead(c *gin.Context) {
 
 	// Get the server using the UUID from the token.
 	// Note: HEAD endpoint is a probe, so we don't consume the one-time token here.
-	if _, ok := manager.Get(token.ServerUuid); !ok || !token.HasScope(tokens.BackupDownload) {
+	if _, ok := manager.Get(token.ServerUuid); !ok || token.Denylisted() || !token.HasScope(tokens.BackupDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	// Validate UUID
 	if _, err := uuid.Parse(token.BackupUuid); err != nil {
@@ -167,12 +168,13 @@ func getDownloadBackup(c *gin.Context) {
 	}
 
 	// Get the server using the UUID from the token
-	if _, ok := manager.Get(token.ServerUuid); !ok || !token.IsUniqueRequest() || !token.HasScope(tokens.BackupDownload) {
+	if _, ok := manager.Get(token.ServerUuid); !ok || token.Denylisted() || !token.IsUniqueRequest() || !token.HasScope(tokens.BackupDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	// Validate UUID
 	if _, err := uuid.Parse(token.BackupUuid); err != nil {
@@ -317,12 +319,13 @@ func getDownloadFile(c *gin.Context) {
 
 	// Get server
 	s, ok := manager.Get(token.ServerUuid)
-	if !ok || !token.IsUniqueRequest() || !token.HasScope(tokens.FileDownload) {
+	if !ok || token.Denylisted() || !token.IsUniqueRequest() || !token.HasScope(tokens.FileDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	// Get file
 	f, st, err := s.Filesystem().File(token.FilePath)

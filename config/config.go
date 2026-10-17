@@ -69,6 +69,14 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	// The maximum number of connections a single user may have open at once, or
+	// zero to use the default of 32.
+	MaxConnectionsPerUser int `json:"-" yaml:"max_connections_per_user"`
+	// The maximum number of connections from a single IP address, or IPv6 /64
+	// network, that may be authenticating at once, or zero to use the default of
+	// 16. Raise this if clients connect through a proxy, since they then all
+	// appear to come from the address of the proxy.
+	MaxAuthenticatingConnectionsPerIP int `json:"-" yaml:"max_authenticating_connections_per_ip"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -91,6 +99,11 @@ type ApiConfiguration struct {
 	// is enabled on this instance. If set to "true" remote downloads will not be possible for
 	// servers.
 	DisableRemoteDownload bool `json:"-" yaml:"disable_remote_download"`
+
+	// RemoteDownloadAllowlist allows remote downloads of files into server directories to
+	// connect to otherwise blocked private/internal destinations. Entries may be hostnames,
+	// IP addresses, or CIDR ranges.
+	RemoteDownloadAllowlist []string `json:"-" yaml:"remote_download_allowlist"`
 
 	// The maximum size for files uploaded through the Panel in MB.
 	UploadLimit int64 `default:"100" json:"upload_limit" yaml:"upload_limit"`
@@ -372,7 +385,7 @@ type Configuration struct {
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 
-	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// AllowCORSPrivateNetwork sets the `Access-Control-Allow-Private-Network` header which
 	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
 	// is only required by users running Wings without SSL certificates and using internal IP
 	// addresses in order to connect. Most users should NOT enable this setting.
@@ -419,6 +432,65 @@ type PartialEdit struct {
 	EnableLineCaching bool `default:"true" yaml:"enable_line_caching" json:"enable_line_caching"`
 }
 
+// PanelConfiguration contains the only configuration values the Panel is allowed
+// to set on a node. Everything else in the configuration controls how Wings itself
+// runs on the host and must only be changed by the node operator.
+type PanelConfiguration struct {
+	Debug   bool   `json:"debug"`
+	Uuid    string `json:"uuid"`
+	TokenId string `json:"token_id"`
+	Token   string `json:"token"`
+	Api     struct {
+		Host string `json:"host"`
+		Port int    `json:"port"`
+		Ssl  struct {
+			Enabled         bool   `json:"enabled"`
+			CertificateFile string `json:"cert"`
+			KeyFile         string `json:"key"`
+		} `json:"ssl"`
+		UploadLimit int64 `json:"upload_limit"`
+	} `json:"api"`
+	System struct {
+		Sftp struct {
+			Port int `json:"bind_port"`
+		} `json:"sftp"`
+	} `json:"system"`
+}
+
+// PanelConfiguration returns the values in the configuration that the Panel is
+// allowed to set.
+func (c *Configuration) PanelConfiguration() PanelConfiguration {
+	var p PanelConfiguration
+	p.Debug = c.Debug
+	p.Uuid = c.Uuid
+	p.TokenId = c.AuthenticationTokenId
+	p.Token = c.AuthenticationToken
+	p.Api.Host = c.Api.Host
+	p.Api.Port = c.Api.Port
+	p.Api.Ssl.Enabled = c.Api.Ssl.Enabled
+	p.Api.Ssl.CertificateFile = c.Api.Ssl.CertificateFile
+	p.Api.Ssl.KeyFile = c.Api.Ssl.KeyFile
+	p.Api.UploadLimit = c.Api.UploadLimit
+	p.System.Sftp.Port = c.System.Sftp.Port
+	return p
+}
+
+// ApplyPanelConfiguration sets the values in the configuration that the Panel is
+// allowed to set.
+func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
+	c.Debug = p.Debug
+	c.Uuid = p.Uuid
+	c.AuthenticationTokenId = p.TokenId
+	c.AuthenticationToken = p.Token
+	c.Api.Host = p.Api.Host
+	c.Api.Port = p.Api.Port
+	c.Api.Ssl.Enabled = p.Api.Ssl.Enabled
+	c.Api.Ssl.CertificateFile = p.Api.Ssl.CertificateFile
+	c.Api.Ssl.KeyFile = p.Api.Ssl.KeyFile
+	c.Api.UploadLimit = p.Api.UploadLimit
+	c.System.Sftp.Port = p.System.Sftp.Port
+}
+
 // NewAtPath creates a new struct and set the path where it should be stored.
 // This function does not modify the currently stored global configuration.
 func NewAtPath(path string) (*Configuration, error) {
@@ -449,6 +521,45 @@ func Set(c *Configuration) {
 		_jwtAlgo = jwt.NewHS256([]byte(token))
 	}
 	_config = c
+}
+
+// ResolveToken populates the derived Token field, preferring values pinned
+// through the environment over those in the configuration itself.
+//
+// Set remote when the values came from the Panel. Local values may use
+// "file://" or "$VAR" indirection; expanding one sent over the network would
+// leak files and environment variables back out through the token we attach to
+// every request. Environment overrides must already match remote values so a
+// configuration update cannot leave Wings and the Panel using different keys.
+func (c *Configuration) ResolveToken(remote bool) error {
+	resolve := func(name, env, local string) (string, error) {
+		if remote && (strings.Contains(local, "$") || strings.HasPrefix(local, "file://")) {
+			return "", fmt.Errorf("config: remote %s cannot use token indirection", name)
+		}
+		if env != "" {
+			value, err := Expand(env)
+			if err != nil {
+				return "", err
+			}
+			if remote && value != local {
+				return "", fmt.Errorf("config: remote %s does not match environment override", name)
+			}
+			return value, nil
+		}
+		if remote {
+			return local, nil
+		}
+		return Expand(local)
+	}
+
+	var err error
+	if c.Token.ID, err = resolve("token ID", os.Getenv("WINGS_TOKEN_ID"), c.AuthenticationTokenId); err != nil {
+		return err
+	}
+	if c.Token.Token, err = resolve("token", os.Getenv("WINGS_TOKEN"), c.AuthenticationToken); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetDebugViaFlag tracks if the application is running in debug mode because of
@@ -575,13 +686,13 @@ func EnsurePterodactylUser() error {
 		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /sbin/nologin %[1]s", _config.System.Username)
 		// We have to create the group first on Alpine, so do that here before continuing on
 		// to the user creation process.
-		if _, err := exec.Command("addgroup", "-S", _config.System.Username).Output(); err != nil {
+		if _, err := exec.Command("addgroup", "-S", _config.System.Username).Output(); err != nil { //nolint:gosec // no shell; username comes from the operator's config
 			return err
 		}
 	}
 
 	split := strings.Split(command, " ")
-	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil {
+	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil { //nolint:gosec // no shell; username comes from the operator's config
 		return err
 	}
 	u, err = user.Lookup(_config.System.Username)
@@ -606,7 +717,7 @@ container:x:%d:
 nogroup:x:65534:`,
 		_config.System.User.Gid,
 	))
-	if err := os.WriteFile(filepath.Join(passwd.Directory, "group"), v, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(passwd.Directory, "group"), v, 0o644); err != nil { //nolint:gosec // mounted as /etc/group, which containers must be able to read
 		return fmt.Errorf("failed to write file to %s/group: %v", passwd.Directory, err)
 	}
 
@@ -618,45 +729,38 @@ nobody:x:65534:65534::/var/empty:/bin/sh
 		_config.System.User.Uid,
 		_config.System.User.Gid,
 	))
-	if err := os.WriteFile(filepath.Join(passwd.Directory, "passwd"), v, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(passwd.Directory, "passwd"), v, 0o644); err != nil { //nolint:gosec // mounted as /etc/passwd, which containers must be able to read
 		return fmt.Errorf("failed to write file to %s/passwd: %v", passwd.Directory, err)
 	}
 	return nil
 }
 
-// FromFile reads the configuration from the provided file and stores it in the
-// global singleton for this instance.
-func FromFile(path string) error {
-	b, err := os.ReadFile(path)
+// Load reads the configuration from the provided file without resolving its
+// token or storing it in the global singleton.
+func Load(path string) (*Configuration, error) {
+	b, err := os.ReadFile(path) //nolint:gosec // the configuration file chosen by the operator
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c, err := NewAtPath(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	if err := yaml.Unmarshal(b, c); err != nil {
-		return err
+		return nil, err
 	}
+	return c, nil
+}
 
-	c.Token = Token{
-		ID:    os.Getenv("WINGS_TOKEN_ID"),
-		Token: os.Getenv("WINGS_TOKEN"),
-	}
-	if c.Token.ID == "" {
-		c.Token.ID = c.AuthenticationTokenId
-	}
-	if c.Token.Token == "" {
-		c.Token.Token = c.AuthenticationToken
-	}
-
-	c.Token.ID, err = Expand(c.Token.ID)
+// FromFile reads the configuration from the provided file and stores it in the
+// global singleton for this instance.
+func FromFile(path string) error {
+	c, err := Load(path)
 	if err != nil {
 		return err
 	}
-	c.Token.Token, err = Expand(c.Token.Token)
-	if err != nil {
+
+	if err := c.ResolveToken(false); err != nil {
 		return err
 	}
 
@@ -715,14 +819,14 @@ func ConfigureDirectories() error {
 
 	if _config.System.Passwd.Enable {
 		log.WithField("path", _config.System.Passwd.Directory).Debug("ensuring passwd directory exists")
-		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil {
+		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil { //nolint:gosec // files in here are mounted into containers
 			return err
 		}
 	}
 
 	if _config.System.MachineID.Enable {
 		log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
-		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil {
+		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil { //nolint:gosec // files in here are mounted into containers
 			return err
 		}
 	}
@@ -898,9 +1002,9 @@ func Expand(v string) (string, error) {
 	if strings.HasPrefix(v, filePrefix) {
 		p := v[len(filePrefix):]
 
-		b, err := os.ReadFile(p)
+		b, err := os.ReadFile(p) //nolint:gosec // file:// values come from the operator's config
 		if err != nil {
-			return "", nil
+			return "", err
 		}
 		v = string(bytes.TrimRight(bytes.TrimRight(b, "\r"), "\n"))
 	}
