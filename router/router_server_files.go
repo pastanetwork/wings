@@ -41,7 +41,7 @@ func getServerFileContents(c *gin.Context) {
 				"error":      "The requested resource was not found on the system.",
 				"request_id": c.Writer.Header().Get("X-Request-Id"),
 			})
-		} else if strings.Contains(err.Error(), "filesystem: is a directory") {
+		} else if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error":      "Cannot perform that action: file is a directory.",
 				"request_id": c.Writer.Header().Get("X-Request-Id"),
@@ -52,6 +52,14 @@ func getServerFileContents(c *gin.Context) {
 		return
 	}
 	defer f.Close()
+	// Opening a directory succeeds, but its contents cannot be read as a file.
+	if st.IsDir() {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error":      "Cannot perform that action: file is a directory.",
+			"request_id": c.Writer.Header().Get("X-Request-Id"),
+		})
+		return
+	}
 	// Don't allow a named pipe to be opened.
 	//
 	// @see https://github.com/pterodactyl/panel/issues/4059
@@ -859,7 +867,7 @@ func getFilesDiskUsage(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"used":    cached.Usage,
 			"limit":   cached.Limit,
-			"percent": float64(cached.Usage) / float64(cached.Limit) * 100,
+			"percent": diskUsagePercent(cached.Usage, cached.Limit),
 		})
 		return
 	}
@@ -883,6 +891,15 @@ func getFilesDiskUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"used":    usage,
 		"limit":   limit,
-		"percent": float64(usage) / float64(limit) * 100,
+		"percent": diskUsagePercent(usage, limit),
 	})
+}
+
+// diskUsagePercent returns how much of the disk limit is used, or zero when the
+// server has no limit.
+func diskUsagePercent(usage, limit int64) float64 {
+	if limit <= 0 {
+		return 0
+	}
+	return float64(usage) / float64(limit) * 100
 }

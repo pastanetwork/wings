@@ -78,7 +78,7 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 
 	// Ensure the server backup directory exists
 	serverBackupDir := path.Join(config.Get().System.BackupDirectory, b.ServerId)
-	if err := os.MkdirAll(serverBackupDir, 0o755); err != nil {
+	if err := os.MkdirAll(serverBackupDir, 0o700); err != nil {
 		return nil, errors.Wrap(err, "backup: failed to create server backup directory")
 	}
 

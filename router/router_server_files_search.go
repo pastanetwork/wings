@@ -46,15 +46,16 @@ func isBlacklisted(dirName string) bool {
 }
 
 // searchDirectory recursively searches for files matching the pattern in the given directory.
-func searchDirectory(s *server.Server, dir string, patternLower string, depth int, matchedEntries *[]filesystem.Stat, matchedDirectories *[]string, c *gin.Context) {
+// An error is only returned if dir itself cannot be listed, subdirectories that cannot be
+// listed are skipped.
+func searchDirectory(s *server.Server, dir string, patternLower string, depth int, matchedEntries *[]filesystem.Stat, matchedDirectories *[]string) error {
 	if depth > config.Get().SearchRecursion.MaxRecursionDepth {
-		return
+		return nil
 	}
 
 	stats, err := s.Filesystem().ListDirectory(dir)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"message": "Directory not found"})
-		return
+		return err
 	}
 
 	for _, fileInfo := range stats {
@@ -69,7 +70,7 @@ func searchDirectory(s *server.Server, dir string, patternLower string, depth in
 			}
 			*matchedDirectories = append(*matchedDirectories, fullPath)
 
-			searchDirectory(s, fullPath, patternLower, depth+1, matchedEntries, matchedDirectories, c)
+			_ = searchDirectory(s, fullPath, patternLower, depth+1, matchedEntries, matchedDirectories)
 		}
 
 		if strings.ContainsAny(patternLower, "*?") {
@@ -91,6 +92,7 @@ func searchDirectory(s *server.Server, dir string, patternLower string, depth in
 			}
 		}
 	}
+	return nil
 }
 
 // getFilesBySearch performs a recursive file search in the server's filesystem.
@@ -110,7 +112,10 @@ func getFilesBySearch(c *gin.Context) {
 	matchedEntries := []filesystem.Stat{}
 	matchedDirectories := []string{}
 
-	searchDirectory(s, dir, patternLower, 0, &matchedEntries, &matchedDirectories, c)
+	if err := searchDirectory(s, dir, patternLower, 0, &matchedEntries, &matchedDirectories); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "Directory not found"})
+		return
+	}
 
 	c.JSON(http.StatusOK, matchedEntries)
 }

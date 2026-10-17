@@ -70,7 +70,7 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 
 	// Ensure the server backup directory exists
 	serverBackupDir := path.Join(config.Get().System.BackupDirectory, s.ServerId)
-	if err := os.MkdirAll(serverBackupDir, 0o755); err != nil {
+	if err := os.MkdirAll(serverBackupDir, 0o700); err != nil {
 		return nil, errors.Wrap(err, "backup: failed to create server backup directory")
 	}
 

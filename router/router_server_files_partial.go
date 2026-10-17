@@ -43,7 +43,7 @@ func getFileLines(c *gin.Context) {
 	maxLines := config.Get().PartialEdit.MaxLinesPerRequest
 	if endLine-startLine+1 > maxLines {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "Too many lines requested. Maximum is " + string(rune(maxLines)),
+			"error": "Too many lines requested. Maximum is " + strconv.Itoa(maxLines),
 		})
 		return
 	}
