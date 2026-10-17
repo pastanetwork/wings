@@ -56,7 +56,7 @@ func getServerInstallLogs(c *gin.Context) {
 
 	filename := filepath.Join(config.Get().System.LogDirectory, "install", ID+".log")
 
-	content, err := os.ReadFile(filename)
+	content, err := os.ReadFile(filename) //nolint:gosec // the server ID is a validated UUID inside the configured log directory
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read the log for the installation process."})
 		return
@@ -255,7 +255,7 @@ func deleteServer(c *gin.Context) {
 	}
 
 	// Remove all server backups unless config setting is specified
-	if config.Get().System.Backups.RemoveBackupsOnServerDelete == true {
+	if config.Get().System.Backups.RemoveBackupsOnServerDelete {
 		if err := s.RemoveAllServerBackups(); err != nil {
 			middleware.CaptureAndAbort(c, err)
 			return

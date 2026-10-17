@@ -324,10 +324,16 @@ func getFileMetadata(c *gin.Context) {
 	defer file.Close()
 
 	encoding := detectEncoding(file)
-	file.Seek(0, 0)
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
 
 	lineEnding := detectLineEnding(file)
-	file.Seek(0, 0)
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
 
 	totalLines := countLines(file)
 
