@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,11 @@ import (
 
 const (
 	uploadBufferSize = 1024 * 1024
+
+	// minUploadChunkSize and maxUploadChunkSize bound the chunk size a client may
+	// request, which keeps the number of chunks tracked per session reasonable.
+	minUploadChunkSize = 64 * 1024
+	maxUploadChunkSize = 512 * 1024 * 1024
 )
 
 // UploadSession tracks the state of a chunked file upload.
@@ -36,6 +42,7 @@ type UploadSession struct {
 	TotalChunks    int
 	ReceivedChunks map[int]bool
 	CreatedAt      time.Time
+	finalizing     bool
 	mu             sync.RWMutex
 }
 
@@ -174,6 +181,28 @@ func (s *UploadSession) AllChunksReceived() bool {
 	return len(s.ReceivedChunks) == s.TotalChunks
 }
 
+// ExpectedChunkSize returns the exact number of bytes the chunk at the given
+// index must contain. Every chunk is ChunkSize bytes except the last one, which
+// holds whatever remains of the file.
+func (s *UploadSession) ExpectedChunkSize(chunkIndex int) int64 {
+	if chunkIndex == s.TotalChunks-1 {
+		return s.FileSize - s.ChunkSize*int64(s.TotalChunks-1)
+	}
+	return s.ChunkSize
+}
+
+// BeginFinalize marks the session as being assembled, returning false if it
+// already is so that the same upload cannot be finalized twice at once.
+func (s *UploadSession) BeginFinalize() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizing {
+		return false
+	}
+	s.finalizing = true
+	return true
+}
+
 func (s *UploadSession) GetProgress() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -199,9 +228,30 @@ func postInitChunkedUpload(c *gin.Context) {
 		return
 	}
 
-	cleanPath := filepath.Clean(data.Path)
+	// Resolve the path against the server root so that it can never point above it.
+	cleanPath := strings.TrimLeft(filepath.Clean("/"+data.Path), "/")
+	if cleanPath == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "A file path is required",
+		})
+		return
+	}
 	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
 		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	if data.FileSize <= 0 {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "File size must be greater than zero",
+		})
+		return
+	}
+
+	if data.ChunkSize < min(minUploadChunkSize, data.FileSize) || data.ChunkSize > maxUploadChunkSize {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("Chunk size must be between %d and %d bytes", minUploadChunkSize, maxUploadChunkSize),
+		})
 		return
 	}
 
@@ -213,7 +263,7 @@ func postInitChunkedUpload(c *gin.Context) {
 		return
 	}
 
-	if err := s.Filesystem().HasSpaceErr(true); err != nil {
+	if err := s.Filesystem().HasSpaceFor(data.FileSize); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -235,7 +285,7 @@ func postInitChunkedUpload(c *gin.Context) {
 	}
 
 	tmpDir := filepath.Join(os.TempDir(), "wings-uploads", session.ID)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
 		globalChunkManager.DeleteSession(session.ID)
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -324,21 +374,46 @@ func postUploadChunk(c *gin.Context) {
 	tmpDir := filepath.Join(os.TempDir(), "wings-uploads", session.ID)
 	chunkPath := filepath.Join(tmpDir, fmt.Sprintf("chunk_%d", chunkIndex))
 
-	file, err := os.Create(chunkPath)
+	// Write the chunk to a temporary file and only move it into place once it is
+	// complete, so a chunk that is being uploaded twice at the same time is never
+	// read half written.
+	file, err := os.CreateTemp(tmpDir, fmt.Sprintf("chunk_%d.*.part", chunkIndex))
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	partPath := file.Name()
+	defer os.Remove(partPath)
 	defer file.Close()
 
+	// Never read more than the chunk is expected to contain, so that a client cannot
+	// use a single chunk to fill the temporary directory.
+	expected := session.ExpectedChunkSize(chunkIndex)
 	bufferedWriter := bufio.NewWriterSize(file, uploadBufferSize)
-	written, err := io.Copy(bufferedWriter, c.Request.Body)
+	written, err := io.Copy(bufferedWriter, io.LimitReader(c.Request.Body, expected+1))
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	if written != expected {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("Chunk %d must contain exactly %d bytes", chunkIndex, expected),
+		})
 		return
 	}
 
 	if err := bufferedWriter.Flush(); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	if err := file.Close(); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	if err := os.Rename(partPath, chunkPath); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -392,47 +467,27 @@ func postFinalizeUpload(c *gin.Context) {
 		return
 	}
 
+	if !session.BeginFinalize() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Upload session is already being finalized",
+		})
+		return
+	}
+
 	tmpDir := filepath.Join(os.TempDir(), "wings-uploads", session.ID)
 	defer func() {
 		os.RemoveAll(tmpDir)
 		globalChunkManager.DeleteSession(session.ID)
 	}()
 
-	finalPath := filepath.Join(s.Filesystem().Path(), session.FilePath)
-	finalDir := filepath.Dir(finalPath)
-	if err := os.MkdirAll(finalDir, 0o755); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	finalFile, err := os.Create(finalPath)
-	if err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-	defer finalFile.Close()
-
+	// Assemble the chunks through the server filesystem, which keeps the file inside
+	// the server root, reserves the space against the disk limit and chowns any
+	// directories it has to create.
 	hash := sha256.New()
-	var totalWritten int64
-
-	for i := 0; i < session.TotalChunks; i++ {
-		chunkPath := filepath.Join(tmpDir, fmt.Sprintf("chunk_%d", i))
-		chunkFile, err := os.Open(chunkPath)
-		if err != nil {
-			middleware.CaptureAndAbort(c, err)
-			return
-		}
-
-		written, err := io.Copy(io.MultiWriter(finalFile, hash), chunkFile)
-		chunkFile.Close()
-		if err != nil {
-			middleware.CaptureAndAbort(c, err)
-			return
-		}
-		totalWritten += written
-	}
-
-	if err := s.Filesystem().Chown(session.FilePath); err != nil {
+	chunks := &chunkReader{dir: tmpDir, total: session.TotalChunks}
+	defer chunks.Close()
+	counter := &countingWriter{w: hash}
+	if err := s.Filesystem().Write(session.FilePath, io.TeeReader(chunks, counter), session.FileSize, 0o644); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -442,9 +497,63 @@ func postFinalizeUpload(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "completed",
 		"file_path": session.FilePath,
-		"file_size": totalWritten,
+		"file_size": counter.n,
 		"checksum":  "sha256:" + checksum,
 	})
+}
+
+// chunkReader reads the chunks of an upload one after the other, opening each
+// chunk file only once the previous one has been read.
+type chunkReader struct {
+	dir     string
+	total   int
+	current int
+	file    *os.File
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	for {
+		if r.file == nil {
+			if r.current >= r.total {
+				return 0, io.EOF
+			}
+			f, err := os.Open(filepath.Join(r.dir, fmt.Sprintf("chunk_%d", r.current)))
+			if err != nil {
+				return 0, err
+			}
+			r.file = f
+		}
+		n, err := r.file.Read(p)
+		if err == io.EOF {
+			_ = r.file.Close()
+			r.file = nil
+			r.current++
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
+}
+
+func (r *chunkReader) Close() error {
+	if r.file != nil {
+		return r.file.Close()
+	}
+	return nil
+}
+
+// countingWriter passes writes through to w while counting the bytes written.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
 }
 
 // deleteChunkedUpload cancels an active upload session and removes all stored chunks.

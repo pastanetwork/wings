@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -16,7 +15,10 @@ import (
 	"golang.org/x/text/transform"
 
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/internal/ufs"
 	"github.com/pterodactyl/wings/router/middleware"
+	"github.com/pterodactyl/wings/server"
+	"github.com/pterodactyl/wings/server/filesystem"
 )
 
 // getFileLines returns specific lines from a file without loading the entire file.
@@ -46,23 +48,8 @@ func getFileLines(c *gin.Context) {
 		return
 	}
 
-	cleanPath := strings.TrimLeft(filePath, "/")
-	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	fullPath := filepath.Join(s.Filesystem().Path(), cleanPath)
-	file, err := os.Open(fullPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error":      "File not found",
-				"request_id": c.Writer.Header().Get("X-Request-Id"),
-			})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
+	file, _, ok := openPartialEditFile(c, s, filePath, false)
+	if !ok {
 		return
 	}
 	defer file.Close()
@@ -133,21 +120,8 @@ func postReplaceLine(c *gin.Context) {
 	}
 
 	cleanPath := strings.TrimLeft(data.File, "/")
-	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	fullPath := filepath.Join(s.Filesystem().Path(), cleanPath)
-	file, err := os.Open(fullPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "File not found",
-			})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
+	file, _, ok := openPartialEditFile(c, s, cleanPath, true)
+	if !ok {
 		return
 	}
 
@@ -211,21 +185,8 @@ func postInsertLines(c *gin.Context) {
 	}
 
 	cleanPath := strings.TrimLeft(data.File, "/")
-	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	fullPath := filepath.Join(s.Filesystem().Path(), cleanPath)
-	file, err := os.Open(fullPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "File not found",
-			})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
+	file, _, ok := openPartialEditFile(c, s, cleanPath, true)
+	if !ok {
 		return
 	}
 
@@ -292,21 +253,8 @@ func postDeleteLines(c *gin.Context) {
 	}
 
 	cleanPath := strings.TrimLeft(data.File, "/")
-	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	fullPath := filepath.Join(s.Filesystem().Path(), cleanPath)
-	file, err := os.Open(fullPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "File not found",
-			})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
+	file, _, ok := openPartialEditFile(c, s, cleanPath, true)
+	if !ok {
 		return
 	}
 
@@ -369,28 +317,8 @@ func getFileMetadata(c *gin.Context) {
 		return
 	}
 
-	cleanPath := strings.TrimLeft(filePath, "/")
-	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	fullPath := filepath.Join(s.Filesystem().Path(), cleanPath)
-	fileInfo, err := os.Stat(fullPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "File not found",
-			})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	file, err := os.Open(fullPath)
-	if err != nil {
-		middleware.CaptureAndAbort(c, err)
+	file, fileInfo, ok := openPartialEditFile(c, s, filePath, false)
+	if !ok {
 		return
 	}
 	defer file.Close()
@@ -414,9 +342,54 @@ func getFileMetadata(c *gin.Context) {
 	})
 }
 
+// openPartialEditFile opens a regular file inside the server's root directory
+// through the server filesystem, so paths and symlinks cannot resolve outside
+// of it. Named pipes, devices and directories are refused. When readAll is
+// true the file is about to be read into memory in full, so its size is also
+// checked against the configured limit. If false is returned the request has
+// already been aborted.
+func openPartialEditFile(c *gin.Context, s *server.Server, p string, readAll bool) (ufs.File, filesystem.Stat, bool) {
+	cleanPath := strings.TrimLeft(p, "/")
+	if err := s.Filesystem().IsIgnored(cleanPath); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return nil, filesystem.Stat{}, false
+	}
+
+	file, st, err := s.Filesystem().File(cleanPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"error":      "File not found",
+				"request_id": c.Writer.Header().Get("X-Request-Id"),
+			})
+			return nil, filesystem.Stat{}, false
+		}
+		middleware.CaptureAndAbort(c, err)
+		return nil, filesystem.Stat{}, false
+	}
+
+	if !st.Mode().IsRegular() {
+		_ = file.Close()
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Cannot open files of this type.",
+		})
+		return nil, filesystem.Stat{}, false
+	}
+
+	if maxSize := config.Get().PartialEdit.MaxFileSize; readAll && maxSize > 0 && st.Size() > maxSize {
+		_ = file.Close()
+		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": "File is too large to be edited line by line. Maximum is " + strconv.FormatInt(maxSize, 10) + " bytes.",
+		})
+		return nil, filesystem.Stat{}, false
+	}
+
+	return file, st, true
+}
+
 // detectEncoding analyzes the file's byte order mark and content to determine
 // its character encoding (UTF-8, UTF-8-BOM, or ASCII).
-func detectEncoding(file *os.File) string {
+func detectEncoding(file io.Reader) string {
 	buf := make([]byte, 1024)
 	n, err := file.Read(buf)
 	if err != nil && err != io.EOF {
@@ -437,7 +410,7 @@ func detectEncoding(file *os.File) string {
 
 // detectLineEnding determines the line ending style used in the file
 // (CRLF for Windows, LF for Unix/Linux, or CR for classic Mac).
-func detectLineEnding(file *os.File) string {
+func detectLineEnding(file io.Reader) string {
 	buf := make([]byte, 1024)
 	n, err := file.Read(buf)
 	if err != nil && err != io.EOF {
@@ -462,7 +435,7 @@ func detectLineEnding(file *os.File) string {
 
 // countLines efficiently counts the total number of lines in a file
 // using buffered scanning without loading the entire file into memory.
-func countLines(file *os.File) int {
+func countLines(file io.Reader) int {
 	scanner := bufio.NewScanner(file)
 	maxLineSize := config.Get().PartialEdit.MaxLineSize
 	buf := make([]byte, maxLineSize)

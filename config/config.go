@@ -428,6 +428,10 @@ type PartialEdit struct {
 	// MaxLineSize is the maximum size of a single line (in bytes).
 	MaxLineSize int64 `default:"10485760" yaml:"max_line_size" json:"max_line_size"`
 
+	// MaxFileSize is the maximum size of a file (in bytes) that can be edited line by line,
+	// since the whole file is read into memory to apply the change.
+	MaxFileSize int64 `default:"52428800" yaml:"max_file_size" json:"max_file_size"`
+
 	// EnableLineCaching enables caching of line positions for frequently accessed files.
 	EnableLineCaching bool `default:"true" yaml:"enable_line_caching" json:"enable_line_caching"`
 }
